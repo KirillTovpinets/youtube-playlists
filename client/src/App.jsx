@@ -1,15 +1,23 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Routes, Route } from 'react-router-dom';
 import Sidebar from './components/Sidebar.jsx';
 import VideoGrid from './components/VideoGrid.jsx';
 import VideoPlayer from './components/VideoPlayer.jsx';
 import AddVideoModal from './components/AddVideoModal.jsx';
 import SearchModal from './components/SearchModal.jsx';
+import Settings from './pages/Settings.jsx';
+import { useSettings } from './context/SettingsContext.jsx';
+import { useSession } from './context/SessionContext.jsx';
 
 export default function App() {
+  const { settings } = useSettings();
+  const { sessionActive, startSession, endSession } = useSession();
+
   const [playlists, setPlaylists] = useState([]);
   const [selectedPlaylistId, setSelectedPlaylistId] = useState(null);
   const [videos, setVideos] = useState([]);
   const [selectedVideo, setSelectedVideo] = useState(null);
+  const [pendingVideo, setPendingVideo] = useState(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showSearchModal, setShowSearchModal] = useState(false);
   const [filter, setFilter] = useState('all');
@@ -88,7 +96,10 @@ export default function App() {
     const video = videos.find(v => v.id === videoId);
     await fetch(`/api/videos/${videoId}`, { method: 'DELETE' });
     setVideos(prev => prev.filter(v => v.id !== videoId));
-    if (selectedVideo?.id === videoId) setSelectedVideo(null);
+    if (selectedVideo?.id === videoId) {
+      setSelectedVideo(null);
+      endSession();
+    }
     setPlaylists(prev => prev.map(p =>
       p.id === selectedPlaylistId
         ? { ...p, video_count: p.video_count - 1, viewed_count: (p.viewed_count || 0) - (video?.viewed ? 1 : 0) }
@@ -96,12 +107,49 @@ export default function App() {
     ));
   };
 
-  const openVideo = async (video) => {
+  // Open a video, bypassing the session modal (used internally after session is confirmed).
+  const doOpenVideo = useCallback(async (video) => {
     setSelectedVideo(video);
     if (!video.viewed) {
-      await markViewed(video.id, true);
+      await fetch(`/api/videos/${video.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ viewed: true })
+      }).then(r => r.json()).then(updated => {
+        setVideos(prev => prev.map(v => v.id === video.id ? updated : v));
+        setSelectedVideo(updated);
+        setPlaylists(prev => prev.map(p =>
+          p.id === selectedPlaylistId
+            ? { ...p, viewed_count: (p.viewed_count || 0) + 1 }
+            : p
+        ));
+      });
+    }
+  }, [selectedPlaylistId]);
+
+  // Open a video. Shows session-start modal first if timer is enabled and no session is running.
+  const openVideo = useCallback(async (video) => {
+    if (settings.timerEnabled && !sessionActive) {
+      setPendingVideo(video);
+      return;
+    }
+    await doOpenVideo(video);
+  }, [settings.timerEnabled, sessionActive, doOpenVideo]);
+
+  const handleStartSession = async () => {
+    startSession();
+    if (pendingVideo) {
+      await doOpenVideo(pendingVideo);
+      setPendingVideo(null);
     }
   };
+
+  const handleCancelSession = () => setPendingVideo(null);
+
+  const handleClosePlayer = useCallback(() => {
+    setSelectedVideo(null);
+    endSession();
+  }, [endSession]);
 
   const filteredVideos = videos.filter(v => {
     if (filter === 'watched') return v.viewed;
@@ -109,7 +157,9 @@ export default function App() {
     return true;
   });
 
-  const navigateVideo = (direction) => {
+  // Recreated each render intentionally — VideoPlayer's message handler uses a ref guard
+  // so the listener re-registration on prop change is harmless.
+  const navigateVideoFn = (direction) => {
     if (!selectedVideo) return;
     const idx = filteredVideos.findIndex(v => v.id === selectedVideo.id);
     const next = filteredVideos[idx + direction];
@@ -129,30 +179,46 @@ export default function App() {
       />
 
       <main className="flex-1 flex flex-col overflow-hidden">
-        {selectedPlaylist ? (
-          <VideoGrid
-            playlist={selectedPlaylist}
-            videos={filteredVideos}
-            filter={filter}
-            onFilterChange={setFilter}
-            onVideoClick={openVideo}
-            onVideoRemove={removeVideo}
-            onAddVideo={() => setShowAddModal(true)}
-            onSearchYouTube={() => setShowSearchModal(true)}
-            loading={loading}
+        <Routes>
+          <Route path="/settings" element={<Settings />} />
+          <Route
+            path="*"
+            element={
+              selectedPlaylist ? (
+                <VideoGrid
+                  playlist={selectedPlaylist}
+                  videos={filteredVideos}
+                  filter={filter}
+                  onFilterChange={setFilter}
+                  onVideoClick={openVideo}
+                  onVideoRemove={removeVideo}
+                  onAddVideo={() => setShowAddModal(true)}
+                  onSearchYouTube={() => setShowSearchModal(true)}
+                  loading={loading}
+                />
+              ) : (
+                <EmptyState />
+              )
+            }
           />
-        ) : (
-          <EmptyState />
-        )}
+        </Routes>
       </main>
 
       {selectedVideo && (
         <VideoPlayer
           video={selectedVideo}
           videos={filteredVideos}
-          onClose={() => setSelectedVideo(null)}
-          onNavigate={navigateVideo}
+          onClose={handleClosePlayer}
+          onNavigate={navigateVideoFn}
           onMarkViewed={markViewed}
+        />
+      )}
+
+      {pendingVideo && (
+        <SessionStartModal
+          duration={settings.timerDuration}
+          onStart={handleStartSession}
+          onCancel={handleCancelSession}
         />
       )}
 
@@ -170,6 +236,43 @@ export default function App() {
           existingVideoIds={videos.map(v => v.youtube_id)}
         />
       )}
+    </div>
+  );
+}
+
+function SessionStartModal({ duration, onStart, onCancel }) {
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-zinc-900 border border-zinc-700 rounded-2xl p-8 max-w-sm w-full text-center shadow-2xl">
+        <div className="w-14 h-14 bg-indigo-500/15 rounded-full flex items-center justify-center mx-auto mb-4">
+          <svg className="w-7 h-7 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+              d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        </div>
+        <h2 className="text-xl font-bold mb-2">New Viewing Session</h2>
+        <p className="text-zinc-400 text-sm mb-1">
+          You have <span className="text-white font-semibold">{duration} minutes</span> of viewing time.
+        </p>
+        <p className="text-zinc-500 text-xs mb-6">
+          The timer starts as soon as the first video begins playing.
+          Videos will play automatically while time remains.
+        </p>
+        <div className="flex flex-col gap-3">
+          <button
+            onClick={onStart}
+            className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2.5 rounded-xl transition-colors"
+          >
+            Start Session
+          </button>
+          <button
+            onClick={onCancel}
+            className="w-full bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white font-medium py-2.5 rounded-xl transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

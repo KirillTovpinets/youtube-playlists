@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { NavLink } from 'react-router-dom';
 
 export default function Sidebar({ playlists, selectedId, onSelect, onCreate, onDelete }) {
   const [newName, setNewName] = useState('');
@@ -57,7 +58,7 @@ export default function Sidebar({ playlists, selectedId, onSelect, onCreate, onD
         )}
       </div>
 
-      <nav className="flex-1 overflow-y-auto p-2 space-y-0.5">
+      <nav className="flex-1 overflow-y-auto p-2 space-y-0.5 pb-0">
         {playlists.length === 0 && (
           <p className="text-xs text-zinc-600 text-center py-6">No playlists yet</p>
         )}
@@ -80,6 +81,28 @@ export default function Sidebar({ playlists, selectedId, onSelect, onCreate, onD
           />
         ))}
       </nav>
+
+      {/* Settings link */}
+      <div className="p-2 border-t border-zinc-800 flex-shrink-0">
+        <NavLink
+          to="/settings"
+          className={({ isActive }) =>
+            `flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors ${
+              isActive
+                ? 'bg-zinc-800 text-white'
+                : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
+            }`
+          }
+        >
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+          Settings
+        </NavLink>
+      </div>
     </aside>
   );
 }
