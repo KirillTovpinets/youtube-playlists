@@ -3,6 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const Database = require('better-sqlite3');
 const path = require('path');
+const http = require('http');
+const { WebSocketServer, OPEN } = require('ws');
 
 function decodeHtmlEntities(str) {
   return str
@@ -64,6 +66,7 @@ app.post('/api/playlists', (req, res) => {
     SELECT p.*, 0 as video_count, 0 as viewed_count
     FROM playlists p WHERE p.id = ?
   `).get(result.lastInsertRowid);
+  broadcast({ type: 'db_refresh' });
   res.status(201).json(playlist);
 });
 
@@ -76,11 +79,13 @@ app.patch('/api/playlists/:id', (req, res) => {
     FROM playlists p LEFT JOIN videos v ON v.playlist_id = p.id
     WHERE p.id = ? GROUP BY p.id
   `).get(req.params.id);
+  broadcast({ type: 'db_refresh' });
   res.json(playlist);
 });
 
 app.delete('/api/playlists/:id', (req, res) => {
   db.prepare('DELETE FROM playlists WHERE id = ?').run(req.params.id);
+  broadcast({ type: 'db_refresh' });
   res.status(204).end();
 });
 
@@ -107,6 +112,7 @@ app.post('/api/playlists/:id/videos', (req, res) => {
   ).run(req.params.id, youtube_id, title || 'Unknown Video', thumbnail || '');
 
   const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(result.lastInsertRowid);
+  broadcast({ type: 'db_refresh' });
   res.status(201).json(video);
 });
 
@@ -114,11 +120,13 @@ app.patch('/api/videos/:id', (req, res) => {
   const { viewed } = req.body;
   db.prepare('UPDATE videos SET viewed = ? WHERE id = ?').run(viewed ? 1 : 0, req.params.id);
   const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(req.params.id);
+  broadcast({ type: 'db_refresh' });
   res.json(video);
 });
 
 app.delete('/api/videos/:id', (req, res) => {
   db.prepare('DELETE FROM videos WHERE id = ?').run(req.params.id);
+  broadcast({ type: 'db_refresh' });
   res.status(204).end();
 });
 
@@ -200,7 +208,57 @@ app.get('/api/youtube/info', async (req, res) => {
   }
 });
 
+// ── WebSocket sync ────────────────────────────────────────────────────────────
+// Persistent state broadcast to all devices on connect / on change.
+let syncState = {
+  video:      null,   // currently playing video object (or null)
+  playlistId: null,   // selected playlist id
+  filter:     'all',  // 'all' | 'watched' | 'unwatched'
+  settings:   null,   // { timerEnabled, timerDuration }
+};
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+function broadcast(payload, except = null) {
+  const msg = JSON.stringify(payload);
+  for (const client of wss.clients) {
+    if (client !== except && client.readyState === OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+wss.on('connection', (ws) => {
+  // New device catches up immediately.
+  ws.send(JSON.stringify({ type: 'sync', state: syncState }));
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+
+      if (msg.type === 'update') {
+        // Merge partial updates so callers don't have to send the full object.
+        syncState = { ...syncState, ...msg.state };
+        broadcast({ type: 'sync', state: syncState }, ws);
+      }
+
+      if (msg.type === 'control') {
+        // Ephemeral play/pause relay — not stored, just forwarded.
+        broadcast({ type: 'control', command: msg.command }, ws);
+      }
+
+      if (msg.type === 'db_refresh') {
+        // A device modified the database — tell others to re-fetch.
+        broadcast({ type: 'db_refresh' }, ws);
+      }
+    } catch {}
+  });
+
+  ws.on('error', () => {});
+});
+
 const PORT = process.env.PORT || 3003;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });

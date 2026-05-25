@@ -1,27 +1,49 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Routes, Route } from 'react-router-dom';
 import Sidebar from './components/Sidebar.jsx';
 import VideoGrid from './components/VideoGrid.jsx';
 import VideoPlayer from './components/VideoPlayer.jsx';
+import SyncBanner from './components/SyncBanner.jsx';
 import AddVideoModal from './components/AddVideoModal.jsx';
 import SearchModal from './components/SearchModal.jsx';
 import Settings from './pages/Settings.jsx';
 import { useSettings } from './context/SettingsContext.jsx';
 import { useSession } from './context/SessionContext.jsx';
+import { useSync } from './hooks/useSync.js';
 
 export default function App() {
-  const { settings } = useSettings();
+  const { settings, updateSettings } = useSettings();
   const { sessionActive, startSession, endSession } = useSession();
 
   const [playlists, setPlaylists] = useState([]);
   const [selectedPlaylistId, setSelectedPlaylistId] = useState(null);
   const [videos, setVideos] = useState([]);
   const [selectedVideo, setSelectedVideo] = useState(null);
-  const [pendingVideo, setPendingVideo] = useState(null);
+  const [pendingVideo, setPendingVideo] = useState(null);         // session-start modal
+  const [pendingSyncVideo, setPendingSyncVideo] = useState(null); // sync banner
+  const [syncCommand, setSyncCommand] = useState(null);           // play/pause relay to VideoPlayer
   const [showAddModal, setShowAddModal] = useState(false);
   const [showSearchModal, setShowSearchModal] = useState(false);
   const [filter, setFilter] = useState('all');
   const [loading, setLoading] = useState(false);
+
+  // Stable refs so callbacks don't go stale between renders
+  const videosRef = useRef([]);
+  const selectedPlaylistIdRef = useRef(null);
+  const selectedVideoRef = useRef(null);
+  useEffect(() => { videosRef.current = videos; }, [videos]);
+  useEffect(() => { selectedPlaylistIdRef.current = selectedPlaylistId; }, [selectedPlaylistId]);
+  useEffect(() => { selectedVideoRef.current = selectedVideo; }, [selectedVideo]);
+
+  // Loop-prevention: set true before applying a remote value so the
+  // corresponding broadcast useEffect skips re-sending that same value.
+  const suppressFilterBroadcastRef = useRef(false);
+  const suppressSettingsBroadcastRef = useRef(false);
+
+  // Sequence counter so the same play/pause command can fire twice in a row
+  const syncSeqRef = useRef(0);
+
+  // ── Data fetching ────────────────────────────────────────────────────────
 
   const fetchPlaylists = useCallback(async () => {
     const res = await fetch('/api/playlists');
@@ -38,6 +60,78 @@ export default function App() {
 
   useEffect(() => { fetchPlaylists(); }, [fetchPlaylists]);
   useEffect(() => { fetchVideos(selectedPlaylistId); }, [selectedPlaylistId, fetchVideos]);
+
+  // ── Sync callbacks ───────────────────────────────────────────────────────
+
+  const handleRemoteState = useCallback(async (state) => {
+    const { video: remoteVideo, playlistId, filter: remoteFilter, settings: remoteSettings } = state;
+
+    // Settings: apply without re-broadcasting
+    if (remoteSettings) {
+      suppressSettingsBroadcastRef.current = true;
+      updateSettings(remoteSettings);
+    }
+
+    // Filter: apply without re-broadcasting
+    if (remoteFilter != null) {
+      suppressFilterBroadcastRef.current = true;
+      setFilter(remoteFilter);
+    }
+
+    // Video: if remote closed their player, just clear the banner
+    if (!remoteVideo) {
+      setPendingSyncVideo(null);
+      return;
+    }
+
+    // Already showing this exact video locally — nothing to do
+    if (selectedVideoRef.current?.id === remoteVideo.id) return;
+
+    // Show the sync banner; the user's click provides the autoplay gesture
+    setPendingSyncVideo({ video: remoteVideo, playlistId });
+  }, [updateSettings]);
+
+  const handleRemoteControl = useCallback((command) => {
+    setSyncCommand({ command, seq: ++syncSeqRef.current });
+  }, []);
+
+  const handleDbRefresh = useCallback(() => {
+    fetchPlaylists();
+    if (selectedPlaylistIdRef.current) fetchVideos(selectedPlaylistIdRef.current);
+  }, [fetchPlaylists, fetchVideos]);
+
+  const { sendState, sendControl } = useSync({
+    onState: handleRemoteState,
+    onControl: handleRemoteControl,
+    onDbRefresh: handleDbRefresh,
+  });
+
+  // ── Broadcast local state to other devices ───────────────────────────────
+
+  // Broadcast video + playlist whenever either changes
+  useEffect(() => {
+    sendState({ video: selectedVideo ?? null, playlistId: selectedPlaylistId });
+  }, [selectedVideo, selectedPlaylistId]); // sendState is stable
+
+  // Broadcast filter (skip when the change originated from a remote sync)
+  useEffect(() => {
+    if (suppressFilterBroadcastRef.current) {
+      suppressFilterBroadcastRef.current = false;
+      return;
+    }
+    sendState({ filter });
+  }, [filter]);
+
+  // Broadcast settings (skip when the change originated from a remote sync)
+  useEffect(() => {
+    if (suppressSettingsBroadcastRef.current) {
+      suppressSettingsBroadcastRef.current = false;
+      return;
+    }
+    sendState({ settings });
+  }, [settings]);
+
+  // ── CRUD actions ─────────────────────────────────────────────────────────
 
   const createPlaylist = async (name) => {
     const res = await fetch('/api/playlists', {
@@ -107,9 +201,12 @@ export default function App() {
     ));
   };
 
-  // Open a video, bypassing the session modal (used internally after session is confirmed).
+  // ── Video opening ────────────────────────────────────────────────────────
+
+  // Open a video directly, bypassing the session-start check
   const doOpenVideo = useCallback(async (video) => {
     setSelectedVideo(video);
+    setPendingSyncVideo(null);
     if (!video.viewed) {
       await fetch(`/api/videos/${video.id}`, {
         method: 'PATCH',
@@ -119,15 +216,15 @@ export default function App() {
         setVideos(prev => prev.map(v => v.id === video.id ? updated : v));
         setSelectedVideo(updated);
         setPlaylists(prev => prev.map(p =>
-          p.id === selectedPlaylistId
+          p.id === selectedPlaylistIdRef.current
             ? { ...p, viewed_count: (p.viewed_count || 0) + 1 }
             : p
         ));
       });
     }
-  }, [selectedPlaylistId]);
+  }, []);
 
-  // Open a video. Shows session-start modal first if timer is enabled and no session is running.
+  // Open a video; shows session-start modal first when timer is on and no session is running
   const openVideo = useCallback(async (video) => {
     if (settings.timerEnabled && !sessionActive) {
       setPendingVideo(video);
@@ -151,14 +248,39 @@ export default function App() {
     endSession();
   }, [endSession]);
 
+  // ── SyncBanner: join the video another device is watching ────────────────
+
+  const handleJoinSync = useCallback(async () => {
+    if (!pendingSyncVideo) return;
+    const { video: remoteVideo, playlistId } = pendingSyncVideo;
+
+    // Switch to the remote's playlist first if needed
+    if (playlistId && playlistId !== selectedPlaylistIdRef.current) {
+      setSelectedPlaylistId(playlistId);
+      // Give fetchVideos time to load the new playlist's videos
+      await new Promise(resolve => setTimeout(resolve, 600));
+    }
+
+    // Prefer the fully-loaded local object; fall back to the lightweight remote snapshot
+    const match = videosRef.current.find(v => v.id === remoteVideo.id) ?? remoteVideo;
+    await doOpenVideo(match);
+  }, [pendingSyncVideo, doOpenVideo]);
+
+  // ── YouTube play/pause relay ─────────────────────────────────────────────
+
+  // VideoPlayer calls this when the user pauses/plays; we relay to other devices
+  const handleYtStateChange = useCallback(({ playing }) => {
+    sendControl(playing ? 'play' : 'pause');
+  }, []); // sendControl is stable (empty deps in useSync)
+
+  // ── Filtered video list & navigation ────────────────────────────────────
+
   const filteredVideos = videos.filter(v => {
     if (filter === 'watched') return v.viewed;
     if (filter === 'unwatched') return !v.viewed;
     return true;
   });
 
-  // Recreated each render intentionally — VideoPlayer's message handler uses a ref guard
-  // so the listener re-registration on prop change is harmless.
   const navigateVideoFn = (direction) => {
     if (!selectedVideo) return;
     const idx = filteredVideos.findIndex(v => v.id === selectedVideo.id);
@@ -204,6 +326,15 @@ export default function App() {
         </Routes>
       </main>
 
+      {/* Sync banner: shown when another device is watching a video but we haven't joined yet */}
+      {pendingSyncVideo && !selectedVideo && (
+        <SyncBanner
+          video={pendingSyncVideo.video}
+          onJoin={handleJoinSync}
+          onDismiss={() => setPendingSyncVideo(null)}
+        />
+      )}
+
       {selectedVideo && (
         <VideoPlayer
           video={selectedVideo}
@@ -211,6 +342,8 @@ export default function App() {
           onClose={handleClosePlayer}
           onNavigate={navigateVideoFn}
           onMarkViewed={markViewed}
+          syncCommand={syncCommand}
+          onYtStateChange={handleYtStateChange}
         />
       )}
 

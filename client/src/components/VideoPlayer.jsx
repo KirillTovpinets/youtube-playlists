@@ -27,7 +27,7 @@ function sendYouTubeCommand(iframe, func) {
   );
 }
 
-export default function VideoPlayer({ video, videos, onClose, onNavigate, onMarkViewed }) {
+export default function VideoPlayer({ video, videos, onClose, onNavigate, onMarkViewed, syncCommand, onYtStateChange }) {
   const currentIdx = videos.findIndex(v => v.id === video.id);
   const hasPrev = currentIdx > 0;
   const hasNext = currentIdx < videos.length - 1;
@@ -44,6 +44,9 @@ export default function VideoPlayer({ video, videos, onClose, onNavigate, onMark
   const iframeRef = useRef(null);
   // Prevents firing onNavigate more than once per video-end event
   const navigatedRef = useRef(false);
+  // Set to true just before we send a syncCommand to the iframe so the
+  // resulting YouTube state-change event is not re-broadcast back to the sender
+  const suppressYtReportRef = useRef(false);
 
   // Reset navigation guard when video changes
   useEffect(() => {
@@ -63,24 +66,48 @@ export default function VideoPlayer({ video, videos, onClose, onNavigate, onMark
     sendYouTubeCommand(iframeRef.current, 'playVideo');
   }, [dismissed]);
 
-  // Listen for YouTube playerState messages to detect video end
+  // Execute play/pause commands relayed from another device
+  useEffect(() => {
+    if (!syncCommand) return;
+    suppressYtReportRef.current = true;
+    sendYouTubeCommand(
+      iframeRef.current,
+      syncCommand.command === 'play' ? 'playVideo' : 'pauseVideo'
+    );
+  }, [syncCommand]); // syncCommand.seq changes every time so this always runs
+
+  // Listen for YouTube playerState messages
+  // playerState: -1 unstarted | 0 ended | 1 playing | 2 paused | 3 buffering | 5 cued
   useEffect(() => {
     const handleMessage = (event) => {
       if (event.origin !== 'https://www.youtube.com') return;
       try {
         const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-        if (data.event === 'infoDelivery' && data.info?.playerState === 0) {
-          // playerState 0 = ended
+        if (data.event !== 'infoDelivery') return;
+        const ps = data.info?.playerState;
+
+        if (ps === 0) {
+          // Ended — auto-advance if session permits
           if (!navigatedRef.current && canAutoAdvance && hasNext) {
             navigatedRef.current = true;
             onNavigate(1);
+          }
+        }
+
+        if (ps === 1 || ps === 2) {
+          // Playing or paused — relay to other devices, but suppress if we
+          // triggered this state ourselves via a syncCommand
+          if (suppressYtReportRef.current) {
+            suppressYtReportRef.current = false;
+          } else {
+            onYtStateChange?.({ playing: ps === 1 });
           }
         }
       } catch {}
     };
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [canAutoAdvance, hasNext, onNavigate]);
+  }, [canAutoAdvance, hasNext, onNavigate, onYtStateChange]);
 
   // Fullscreen tracking
   useEffect(() => {
